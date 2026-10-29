@@ -1,0 +1,143 @@
+name: USB/IP client builder (OpenWrt 22.03.7)
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "ImageBuilder profile"
+        default: tplink_tl-wr840n-v4
+      extra_packages:
+        description: "Extra packages for the image (space separated), e.g. kmod-usb-storage"
+        default: ""
+      size_limit:
+        description: "Max sysupgrade image size in bytes (7808k = 7995392)"
+        default: "7995392"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OWRT: "22.03.7"
+  TARGET: ramips/mt76x8
+  IB: openwrt-imagebuilder-22.03.7-ramips-mt76x8.Linux-x86_64
+  PROFILE: ${{ inputs.profile || 'tplink_tl-wr840n-v4' }}
+  EXTRA_PACKAGES: ${{ inputs.extra_packages || '' }}
+  SIZE_LIMIT: ${{ inputs.size_limit || '7995392' }}
+
+jobs:
+  package:
+    name: Build luci-app-usbip (.ipk)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax checks
+        run: |
+          sh -n luci-app-usbip/root/usr/libexec/usbip-ctl
+          sh -n luci-app-usbip/root/etc/init.d/usbip
+          sh -n luci-app-usbip/root/etc/uci-defaults/90-luci-usbip
+          sh -n scripts/check-size.sh
+          for f in luci-app-usbip/root/usr/share/rpcd/acl.d/*.json \
+                   luci-app-usbip/root/usr/share/luci/menu.d/*.json; do
+            python3 -m json.tool "$f" > /dev/null
+          done
+
+      - name: Build ipk (architecture-independent, no SDK)
+        run: sh scripts/build-ipk.sh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipk
+          path: dist/luci-app-usbip_*.ipk
+          if-no-files-found: error
+
+  image:
+    name: Build firmware image
+    needs: package
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ipk
+          path: ipk
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses5-dev gawk zstd python3 rsync unzip
+
+      - name: Download and verify ImageBuilder
+        run: |
+          B=https://downloads.openwrt.org/releases/${OWRT}/targets/${TARGET}
+          wget -q "$B/${IB}.tar.xz" "$B/sha256sums"
+          grep "${IB}.tar.xz" sha256sums | sha256sum -c -
+          tar xf "${IB}.tar.xz"
+
+      - name: Check that the profile exists
+        run: |
+          make -C "${IB}" info | grep -E "^${PROFILE}:" \
+            || { echo "::error::Profile ${PROFILE} not found"; make -C "${IB}" info | grep -E '^[a-z0-9_-]+:$' | head -50; exit 1; }
+
+      - name: Build image (LuCI + USB/IP client)
+        run: |
+          # luci-app-usbip is embedded through the FILES overlay: no local package
+          # index or signature handling. usbip and kmods come from the official repo.
+          rm -rf files /tmp/ipk-x; mkdir -p files /tmp/ipk-x
+          IPK=$(find ipk -name 'luci-app-usbip_*.ipk' | head -n1)
+          [ -n "$IPK" ] || { echo "::error::ipk artifact not found"; find ipk -ls; exit 1; }
+          echo "Using $IPK"
+          tar xzf "$IPK" -C /tmp/ipk-x
+          tar xzf /tmp/ipk-x/data.tar.gz -C files
+          # exec bits may be lost in git/web uploads: set them explicitly
+          for f in usr/libexec/usbip-ctl etc/init.d/usbip etc/uci-defaults/90-luci-usbip; do
+            [ -f "files/$f" ] || { echo "::error::missing files/$f"; find files -type f; exit 1; }
+            chmod 755 "files/$f"
+          done
+          find files -type f -ls
+          make -C "${IB}" image PROFILE="${PROFILE}" FILES="$GITHUB_WORKSPACE/files" \
+            PACKAGES="luci rpcd kmod-usb-core kmod-usbip kmod-usbip-client usbip usbip-client ${EXTRA_PACKAGES}"
+
+      - name: Check size
+        run: |
+          IMG=$(find "${IB}/bin/targets" -name "*${PROFILE}*sysupgrade.bin" | head -n1)
+          sh scripts/check-size.sh "$IMG" "${SIZE_LIMIT}" | tee size.txt
+          { echo '### Firmware'; echo '```'; cat size.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect output
+        run: |
+          mkdir -p out
+          find "${IB}/bin/targets" -type f \( -name "*${PROFILE}*" -o -name 'sha256sums' -o -name '*.manifest' \) -exec cp {} out/ \;
+          cp ipk/luci-app-usbip_*.ipk out/
+          (cd out && sha256sum * > SHA256SUMS.txt)
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: image
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: out
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
