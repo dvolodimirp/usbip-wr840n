@@ -1,0 +1,5 @@
+# Example (auto-attach at boot):
+# config device
+#	option enabled '1'
+#	option host '192.168.1.10'
+#	option busid '1-1'

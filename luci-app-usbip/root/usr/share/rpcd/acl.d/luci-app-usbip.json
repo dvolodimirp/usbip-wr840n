@@ -1,0 +1,12 @@
+{
+	"luci-app-usbip": {
+		"description": "Grant access to USB/IP client controls",
+		"read": {
+			"file": { "/usr/libexec/usbip-ctl": [ "exec" ] },
+			"uci": [ "usbip" ]
+		},
+		"write": {
+			"uci": [ "usbip" ]
+		}
+	}
+}

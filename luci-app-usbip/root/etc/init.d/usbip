@@ -1,0 +1,29 @@
+#!/bin/sh /etc/rc.common
+# Attach devices from /etc/config/usbip at boot (waits for the network).
+START=99
+STOP=10
+
+attach_one() {
+	local enabled host busid i=0
+	config_get_bool enabled "$1" enabled 1
+	config_get host "$1" host
+	config_get busid "$1" busid
+	[ "$enabled" = 1 ] && [ -n "$host" ] && [ -n "$busid" ] || return 0
+	while [ $i -lt 6 ]; do
+		/usr/libexec/usbip-ctl attach "$host" "$busid" | grep -q '"ok": true' && return 0
+		i=$((i+1)); sleep 5
+	done
+	logger -t usbip "failed to attach $host $busid"
+}
+
+start() {
+	modprobe vhci-hcd 2>/dev/null
+	config_load usbip
+	( config_foreach attach_one device ) &
+}
+
+stop() {
+	for p in $(usbip port 2>/dev/null | sed -n 's/^Port \([0-9]*\):.*/\1/p'); do
+		usbip detach -p "$((10#$p))" >/dev/null 2>&1
+	done
+}

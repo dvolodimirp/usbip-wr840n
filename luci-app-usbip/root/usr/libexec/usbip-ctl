@@ -1,0 +1,60 @@
+#!/bin/sh
+# usbip-ctl: restricted backend for luci-app-usbip.
+# The only thing LuCI is allowed to execute (see rpcd ACL). All input is
+# validated; nothing is passed through a shell eval.
+# Commands: status | list <host> | attach <host> <busid> | detach <port>
+
+. /usr/share/libubox/jshn.sh
+
+reply_err() { json_init; json_add_boolean ok 0; json_add_string error "$1"; json_dump; exit 0; }
+valid_host()  { echo "$1" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$|^[0-9A-Fa-f:]{2,39}$'; }
+valid_busid() { echo "$1" | grep -Eq '^[0-9]+-[0-9]+(\.[0-9]+)*$'; }
+valid_port()  { echo "$1" | grep -Eq '^[0-9]{1,2}$'; }
+
+run() { if command -v timeout >/dev/null 2>&1; then timeout 15 "$@"; else "$@"; fi; }
+
+cmd_status() {
+	json_init; json_add_boolean ok 1; json_add_array ports
+	usbip port 2>/dev/null | awk '
+		/^Port [0-9]+:/ { if (p != "") print p "|" u "|" d; p=$2; sub(":","",p); u=""; d=""; next }
+		/usbip:\/\// { u=$NF; next }
+		/\([0-9a-fA-F]{4}:[0-9a-fA-F]{4}\)/ && d=="" { sub(/^[ \t]+/,""); d=$0 }
+		END { if (p != "") print p "|" u "|" d }
+	' | while IFS='|' read -r p u d; do
+		json_add_object ""; json_add_int port "$((10#$p))"
+		json_add_string url "$u"; json_add_string desc "$d"; json_close_object
+	done
+	json_close_array; json_dump
+}
+
+cmd_list() {
+	valid_host "$1" || reply_err "invalid host"
+	out="$(run usbip list -r "$1" 2>&1)" || reply_err "$(echo "$out" | tail -n1)"
+	json_init; json_add_boolean ok 1; json_add_array devices
+	echo "$out" | sed -n 's/^ *\([0-9][0-9.-]*\): \(.*\)$/\1|\2/p' | while IFS='|' read -r b d; do
+		json_add_object ""; json_add_string busid "$b"; json_add_string desc "$d"; json_close_object
+	done
+	json_close_array; json_dump
+}
+
+cmd_attach() {
+	valid_host "$1" || reply_err "invalid host"
+	valid_busid "$2" || reply_err "invalid busid"
+	modprobe vhci-hcd 2>/dev/null
+	out="$(run usbip attach -r "$1" -b "$2" 2>&1)" || reply_err "$(echo "$out" | tail -n1)"
+	json_init; json_add_boolean ok 1; json_dump
+}
+
+cmd_detach() {
+	valid_port "$1" || reply_err "invalid port"
+	out="$(usbip detach -p "$1" 2>&1)" || reply_err "$(echo "$out" | tail -n1)"
+	json_init; json_add_boolean ok 1; json_dump
+}
+
+case "$1" in
+	status) cmd_status ;;
+	list)   cmd_list "$2" ;;
+	attach) cmd_attach "$2" "$3" ;;
+	detach) cmd_detach "$2" ;;
+	*) reply_err "unknown command" ;;
+esac
